@@ -1,7 +1,6 @@
 
 import time
 from datetime import datetime, timedelta, timezone
-from io import BytesIO
 
 import pandas as pd
 import requests
@@ -13,62 +12,39 @@ st.set_page_config(
     layout="wide",
 )
 
-API_URL = "https://fapi.binance.com/fapi/v1/klines"
-COLUMNS = [
-    "timestamp", "open", "high", "low", "close", "volume",
-    "close_time", "quote_volume", "trades",
-    "taker_buy_volume", "taker_buy_quote_volume", "ignore",
-]
+API_URL = "https://api.bybit.com/v5/market/kline"
+INTERVAL_MS = 5 * 60 * 1000
 
-st.title("📊 ORBIT Scalper Futures")
-st.subheader("دریافت داده واقعی بازار Futures")
+st.title("ORBIT Scalper Futures")
+st.subheader("دریافت داده واقعی BTCUSDT Futures")
 st.info(
-    "این ابزار فقط داده عمومی بازار را دریافت می‌کند. "
-    "کلید API و اتصال برای ثبت سفارش لازم نیست."
-)
-
-symbol = st.selectbox(
-    "جفت‌ارز",
-    ["BTCUSDT"],
-    index=0,
-)
-
-days = st.selectbox(
-    "بازه تاریخی",
-    [7, 30, 60, 90],
-    index=3,
-    format_func=lambda x: f"{x} روز اخیر",
-)
-
-st.caption(
-    "بازه زمانی: کندل ۵ دقیقه‌ای | بازار: Binance USDⓈ-M Futures"
+    "منبع داده: Bybit Linear Perpetual. "
+    "این برنامه فقط داده عمومی دریافت می‌کند و سفارش ثبت نمی‌کند."
 )
 
 
-def fetch_klines(days_back: int) -> pd.DataFrame:
+def fetch_klines(days_back):
     now = datetime.now(timezone.utc)
-    start = now - timedelta(days=days_back)
-
-    start_ms = int(start.timestamp() * 1000)
     now_ms = int(now.timestamp() * 1000)
+    start_ms = int(
+        (now - timedelta(days=days_back)).timestamp() * 1000
+    )
 
     all_rows = []
-    cursor = start_ms
+    cursor_end = now_ms
+    session = requests.Session()
     progress = st.progress(0)
     status = st.empty()
 
-    # حدود 12 کندل در ساعت، با 1500 کندل در هر درخواست
-    expected = days_back * 24 * 12
-    request_count = 0
-
-    with requests.Session() as session:
-        while cursor < now_ms:
+    try:
+        while cursor_end > start_ms:
             params = {
-                "symbol": symbol,
-                "interval": "5m",
-                "startTime": cursor,
-                "endTime": now_ms,
-                "limit": 1500,
+                "category": "linear",
+                "symbol": "BTCUSDT",
+                "interval": "5",
+                "start": start_ms,
+                "end": cursor_end,
+                "limit": 1000,
             }
 
             response = session.get(
@@ -76,111 +52,138 @@ def fetch_klines(days_back: int) -> pd.DataFrame:
                 params=params,
                 timeout=30,
             )
+            response.raise_for_status()
+            payload = response.json()
 
-            if response.status_code != 200:
+            if payload.get("retCode") != 0:
                 raise RuntimeError(
-                    f"Binance HTTP {response.status_code}: "
-                    f"{response.text[:500]}"
+                    payload.get("retMsg", "خطای Bybit API")
                 )
 
-            rows = response.json()
+            rows = payload.get("result", {}).get("list", [])
 
             if not rows:
                 break
 
+            # Bybit داده‌ها را از جدید به قدیم برمی‌گرداند.
             all_rows.extend(rows)
-            request_count += 1
+            times = [int(row[0]) for row in rows]
+            oldest_ms = min(times)
 
-            last_open_ms = int(rows[-1][0])
-            next_cursor = last_open_ms + 5 * 60 * 1000
+            status.write(
+                f"کندل‌های دریافت‌شده: {len(all_rows):,}"
+            )
+            progress.progress(
+                min(
+                    max((now_ms - oldest_ms) /
+                        (now_ms - start_ms), 0),
+                    1,
+                )
+            )
 
-            if next_cursor <= cursor:
+            if oldest_ms <= start_ms:
                 break
 
-            cursor = next_cursor
+            next_end = oldest_ms - 1
+            if next_end >= cursor_end:
+                break
 
-            progress.progress(
-                min(len(all_rows) / expected, 1.0)
-            )
-            status.write(
-                f"دریافت شده: {len(all_rows):,} کندل | "
-                f"درخواست‌ها: {request_count}"
-            )
+            cursor_end = next_end
+            time.sleep(0.12)
 
-            # مکث کوتاه برای کاهش فشار درخواست‌ها
-            time.sleep(0.15)
+    finally:
+        session.close()
 
     if not all_rows:
         raise RuntimeError(
-            "هیچ داده‌ای دریافت نشد. اتصال یا دسترسی به API را بررسی کن."
+            "هیچ داده‌ای دریافت نشد. دسترسی به API را بررسی کن."
         )
 
-    df = pd.DataFrame(all_rows, columns=COLUMNS)
+    columns = [
+        "timestamp", "open", "high", "low", "close",
+        "volume", "turnover",
+    ]
+    raw = pd.DataFrame(all_rows, columns=columns)
+    raw["timestamp_ms"] = pd.to_numeric(
+        raw["timestamp"], errors="coerce"
+    )
+    raw = raw.dropna(subset=["timestamp_ms"])
+    raw["timestamp_ms"] = raw["timestamp_ms"].astype("int64")
+    raw = raw.drop_duplicates(subset=["timestamp_ms"])
 
-    df = df.drop_duplicates(subset=["timestamp"])
-    df["timestamp"] = pd.to_datetime(
-        df["timestamp"], unit="ms", utc=True
+    # فقط کندل‌هایی که کاملاً بسته شده‌اند.
+    raw = raw[
+        (raw["timestamp_ms"] >= start_ms)
+        & (raw["timestamp_ms"] + INTERVAL_MS <= now_ms)
+    ].copy()
+
+    raw["timestamp"] = pd.to_datetime(
+        raw["timestamp_ms"], unit="ms", utc=True
     )
 
-    # کندل هنوز بسته‌نشده وارد بک‌تست نشود
-    df = df[df["close_time"] < int(now_ms)]
+    for col in ["open", "high", "low", "close", "volume"]:
+        raw[col] = pd.to_numeric(raw[col], errors="coerce")
 
-    # تبدیل قیمت‌ها و حجم‌ها به عدد
-    for col in [
-        "open", "high", "low", "close", "volume"
-    ]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = df.dropna(
+    raw = raw.dropna(
         subset=["timestamp", "open", "high", "low", "close"]
     )
-    df = df.sort_values("timestamp").reset_index(drop=True)
+    raw = raw.sort_values("timestamp").reset_index(drop=True)
 
-    # قالب سازگار با ورودی موتور بک‌تست
-    output = df[[
-        "timestamp", "open", "high", "low", "close", "volume"
-    ]].copy()
+    output = raw[
+        ["timestamp", "open", "high", "low", "close", "volume"]
+    ].copy()
 
-    output["timestamp"] = (
-        output["timestamp"]
-        .dt.strftime("%Y-%m-%d %H:%M:%S")
+    output["timestamp"] = output["timestamp"].dt.strftime(
+        "%Y-%m-%d %H:%M:%S"
     )
 
     return output
 
 
-if st.button("دریافت داده واقعی و ساخت CSV", type="primary"):
+days = st.selectbox(
+    "بازه تاریخی",
+    [7, 30, 60, 90],
+    index=3,
+    format_func=lambda value: f"{value} روز اخیر",
+)
+
+st.caption("نماد: BTCUSDT | بازار: قرارداد خطی دائمی | تایم‌فریم: ۵ دقیقه")
+
+if st.button("دریافت داده و ساخت CSV", type="primary"):
     try:
-        with st.spinner("در حال دریافت کندل‌ها از Binance Futures..."):
+        with st.spinner("در حال دریافت داده‌های تاریخی..."):
             data = fetch_klines(days)
 
-        csv_bytes = data.to_csv(index=False).encode("utf-8")
+        csv_data = data.to_csv(index=False).encode("utf-8")
 
-        st.success("دریافت داده‌ها تمام شد.")
-        st.metric("تعداد کندل‌ها", f"{len(data):,}")
+        st.success("دریافت داده‌ها با موفقیت انجام شد.")
+        st.metric("تعداد کندل‌های بسته‌شده", f"{len(data):,}")
 
-        st.write("نمونه داده‌های دریافت‌شده:")
-        st.dataframe(data.head(20), use_container_width=True)
+        if len(data) < days * 24 * 12 * 0.95:
+            st.warning(
+                "تعداد کندل‌ها کمتر از مقدار مورد انتظار است. "
+                "قبل از بک‌تست، بازه زمانی داده‌ها را بررسی کن."
+            )
 
-        st.write("آخرین کندل‌های دریافت‌شده:")
-        st.dataframe(data.tail(10), use_container_width=True)
+        st.write("آخرین کندل‌ها:")
+        st.dataframe(data.tail(15), use_container_width=True)
 
         st.download_button(
-            label="⬇️ دانلود فایل CSV برای بک‌تست",
-            data=csv_bytes,
-            file_name=f"BTCUSDT_Futures_5m_{days}days.csv",
+            "دانلود CSV برای بک‌تست",
+            data=csv_data,
+            file_name=f"BTCUSDT_BYBIT_5m_{days}days.csv",
             mime="text/csv",
             type="primary",
         )
 
         st.caption(
-            "فایل شامل timestamp, open, high, low, close, volume است. "
-            "داده‌ها واقعی‌اند؛ اما نتیجه بک‌تست سود آینده را تضمین نمی‌کند."
+            "ستون‌ها با ورودی موتور بک‌تست ORBIT سازگارند. "
+            "این داده‌ها تضمین‌کننده سودآوری نیستند."
         )
 
     except Exception as exc:
         st.error(f"دریافت داده ناموفق بود: {exc}")
-        st.write(
-            "اگر خطا مربوط به اتصال یا دسترسی بود، "
-            "ممکن است API از محل اجرای برنامه قابل دسترسی نباشد."
+        st.info(
+            "اگر خطای اتصال یا دسترسی دریافت کردی، "
+            "ممکن است API از محیط میزبانی قابل دسترسی نباشد."
         )
